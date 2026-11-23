@@ -2,7 +2,9 @@
 
 Part 1 fits the GP core to fake pilot AUROCs drawn from a known power law plus
 noise at sizes 60-360, then scores forecasts at 414-720 and 804-20000 with the
-paper's metrics. Part 2 is a smoke test of the PyHealth ``APExGP`` wrapper on a
+paper's metrics, averaged over 20 synthetic repeats. With the authors' default
+optimizer (Adam, lr=0.01) each fit runs up to ~20k iterations, so Part 1 takes
+several minutes. Part 2 is a smoke test of the PyHealth ``APExGP`` wrapper on a
 small synthetic ``SampleDataset``.
 
 Run from the repository root:
@@ -40,40 +42,53 @@ def true_curve(sizes: np.ndarray) -> np.ndarray:
     return (1.0 - TRUE_EPSILON) - TRUE_THETA1 * sizes**TRUE_THETA2
 
 
-def gp_demo(seed: int = 0) -> None:
-    """Fits both mean functions to noisy pilot data and prints the metrics.
+def gp_demo(n_repeats: int = 20, seed: int = 0) -> None:
+    """Fits both mean functions on repeated synthetic draws and averages metrics.
+
+    Each repeat draws fresh noisy pilot AUROCs at sizes 60-360 and fresh noisy
+    "observed" AUROCs at the target sizes. Coverage from a single draw of 5-6
+    points is too noisy to judge calibration, so metrics are averaged.
 
     Args:
-        seed: Seed for the synthetic noise.
+        n_repeats: Number of synthetic repeats.
+        seed: Base seed; repeat ``r`` uses ``seed + r``.
     """
-    rng = np.random.default_rng(seed)
     pilot_sizes = np.asarray(DEFAULT_SUBSET_SIZES, dtype=float)
-    pilot_aurocs = true_curve(pilot_sizes) + rng.normal(0, NOISE_SD, pilot_sizes.size)
-    targets = {
-        name: (sizes, true_curve(sizes) + rng.normal(0, NOISE_SD, sizes.size))
-        for name, sizes in TARGET_RANGES.items()
-    }
-    print("Pilot sizes: ", pilot_sizes.astype(int).tolist())
-    print("Pilot AUROCs:", np.round(pilot_aurocs, 4).tolist())
+    results: dict[tuple[str, str], list[dict[str, float]]] = {}
+    for rep in range(n_repeats):
+        rng = np.random.default_rng(seed + rep)
+        noise = rng.normal(0, NOISE_SD, pilot_sizes.size)
+        pilot_aurocs = true_curve(pilot_sizes) + noise
+        targets = {
+            name: (sizes, true_curve(sizes) + rng.normal(0, NOISE_SD, sizes.size))
+            for name, sizes in TARGET_RANGES.items()
+        }
+        for mean_function in ("power_law", "arctan"):
+            gp = APExGPRegressor(mean_function=mean_function, seed=seed + rep)
+            gp.fit(pilot_sizes, pilot_aurocs)
+            if rep == 0:
+                hp = gp.hyperparameters_
+                print(
+                    f"[repeat 0, {mean_function}] sigma prior (m, s) = "
+                    f"({gp.sigma_prior_loc_:.4f}, {gp.sigma_prior_scale_:.4f}); "
+                    f"fitted sigma={hp.sigma:.4f}, lengthscale={hp.lengthscale:.4g}, "
+                    f"tau={hp.tau:.4f}; iterations per restart="
+                    f"{gp.n_iterations_run_}"
+                )
+            for name, (sizes, observed) in targets.items():
+                results.setdefault((mean_function, name), []).append(
+                    gp.evaluate(sizes, observed)
+                )
+        print(f"  finished repeat {rep + 1}/{n_repeats}", flush=True)
 
-    for mean_function in ("power_law", "arctan"):
-        gp = APExGPRegressor(mean_function=mean_function, seed=seed)
-        gp.fit(pilot_sizes, pilot_aurocs)
-        print(f"\n== mean_function={mean_function} ==")
-        print("  fitted:", gp.hyperparameters_)
-        for name, (sizes, observed) in targets.items():
-            metrics = gp.evaluate(sizes, observed)
-            mean, lower, upper = gp.predict_interval(sizes)
-            print(
-                f"  {name:>10}: RMSE={metrics['rmse']:.4f}  "
-                f"quantized lik.={metrics['quantized_likelihood']:.3f}  "
-                f"95% coverage={metrics['coverage']:.2f}"
-            )
-            print(
-                f"{'':14}largest size {int(sizes[-1])}: true "
-                f"{observed[-1]:.3f}, predicted {mean[-1]:.3f} "
-                f"[{lower[-1]:.3f}, {upper[-1]:.3f}]"
-            )
+    print(f"\nMean over {n_repeats} repeats:")
+    for (mean_function, name), runs in results.items():
+        avg = {k: float(np.mean([r[k] for r in runs])) for k in runs[0]}
+        print(
+            f"  {mean_function:>9} {name:>10}: RMSE={avg['rmse']:.4f}  "
+            f"quantized lik.={avg['quantized_likelihood']:.3f}  "
+            f"95% coverage={avg['coverage']:.2f}"
+        )
 
 
 def wrapper_smoke_test(seed: int = 0) -> None:
@@ -105,7 +120,7 @@ def wrapper_smoke_test(seed: int = 0) -> None:
         input_schema={"features": "tensor"},
         output_schema={"label": "binary"},
     )
-    model = APExGP(dataset, n_seeds=2, n_restarts=2, n_iterations=500, seed=seed)
+    model = APExGP(dataset, n_seeds=2, seed=seed)
     model.fit()
     print("\n== APExGP wrapper smoke test ==")
     print("  pilot AUROCs:", np.round(model.pilot_results_.auroc_mean, 4).tolist())

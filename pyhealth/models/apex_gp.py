@@ -6,9 +6,13 @@ PMLR 225; arXiv:2311.18025).
 
 A classifier is trained on nested pilot subsets of increasing size and its test
 AUROC is recorded at each size. A Gaussian process with a learning-curve mean
-function (power law or arctan) and a squared-exponential kernel on log size is
+function (power law or arctan) and a squared-exponential kernel on log10 size is
 MAP-fitted to those points, and its truncated posterior predictive gives AUROC
 forecasts with uncertainty at larger training-set sizes.
+
+Parameterization, priors and optimizer settings follow the authors' public code
+(tufts-ml/extrapolating-classifier-accuracy-to-larger-datasets), reimplemented
+in plain torch without gpytorch.
 
 The module has three layers, each usable on its own:
 
@@ -33,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy import stats
 from scipy.optimize import brentq
+from scipy.special import ndtr, ndtri
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline, make_pipeline
@@ -51,8 +56,20 @@ DEFAULT_SUBSET_SIZES: tuple[int, ...] = (60, 94, 147, 230, 360)
 DEFAULT_C_GRID: tuple[float, ...] = (1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0)
 """Inverse L2 regularization strengths searched on the validation split."""
 
+SIGMA_PRIOR_GRID: np.ndarray = np.linspace(0.001, 0.05, 100)
+"""Candidate loc and scale values searched by ``calibrate_sigma_prior``."""
+
+DEFAULT_N_ITERATIONS = 20_000
+"""Maximum Adam iterations per restart at lr=0.01. From the authors' raw = 0
+initialization, sigma and tau start near 0.83 and must shrink to ~0.005-0.01,
+which takes ~16k iterations at lr=0.01; the data-driven restart converges in
+~2-4k and stops early."""
+
+NOISE_VARIANCE_FLOOR = 1e-4
+"""Lower bound on tau**2 (gpytorch GaussianLikelihood default), so tau >= 0.01."""
+
 _LOG_2PI = math.log(2.0 * math.pi)
-_MIN_POSITIVE = 1e-6
+_LENGTHSCALE_FLOOR = 1e-6  # keeps (log10 x - log10 x') / lengthscale finite
 _PARAM_NAMES = ("epsilon", "theta1", "theta2", "sigma", "lengthscale", "tau")
 
 
@@ -112,20 +129,21 @@ def log_rbf_kernel(
     sigma: torch.Tensor | float,
     lengthscale: torch.Tensor | float,
 ) -> torch.Tensor:
-    """Squared-exponential kernel on log sizes.
+    """Squared-exponential kernel on base-10 log sizes.
 
-    k(x, x') = sigma**2 * exp(-(log x - log x')**2 / (2 * lengthscale**2)).
+    k(x, x') = sigma**2 * exp(-(log10 x - log10 x')**2 / (2 * lengthscale**2)),
+    matching the authors' code, which feeds log10(x) to an RBF kernel.
 
     Args:
         x1: Positive sizes, shape (n,).
         x2: Positive sizes, shape (m,).
-        sigma: Output scale (> 0).
-        lengthscale: Lengthscale in log-size units (> 0).
+        sigma: Output scale (> 0); sigma**2 is gpytorch's ``outputscale``.
+        lengthscale: Lengthscale in log10-size units (> 0).
 
     Returns:
         Kernel matrix, shape (n, m).
     """
-    diff = torch.log(x1).unsqueeze(-1) - torch.log(x2).unsqueeze(-2)
+    diff = torch.log10(x1).unsqueeze(-1) - torch.log10(x2).unsqueeze(-2)
     return sigma**2 * torch.exp(-0.5 * (diff / lengthscale) ** 2)
 
 
@@ -208,7 +226,7 @@ def gp_posterior_predictive(
         x_test: Query sizes, shape (Q,).
         mean_fn: Prior mean function of sizes.
         sigma: Kernel output scale.
-        lengthscale: Kernel lengthscale (log-size units).
+        lengthscale: Kernel lengthscale (log10-size units).
         tau: Observation noise standard deviation.
         jitter: Initial Cholesky jitter.
 
@@ -250,33 +268,131 @@ def truncated_normal_log_prob(
     return -0.5 * z**2 - math.log(scale) - 0.5 * _LOG_2PI - log_mass
 
 
+def _sample_positive_truncnorm(
+    loc: float | np.ndarray,
+    scale: float | np.ndarray,
+    size: int | tuple[int, ...],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draws Normal(loc, scale) samples truncated to (0, infinity).
+
+    Uses the inverse CDF written through the upper tail,
+    x = loc - scale * Phi^{-1}((1 - u) * Phi(loc / scale)) with u ~ U[0, 1),
+    which is accurate for any sign of ``loc``. ``loc`` and ``scale``
+    broadcast against ``size``.
+
+    Args:
+        loc: Location(s) of the untruncated normal.
+        scale: Scale(s) of the untruncated normal (> 0).
+        size: Output shape.
+        rng: NumPy random generator.
+
+    Returns:
+        Positive samples of shape ``size``.
+    """
+    loc = np.asarray(loc, dtype=np.float64)
+    scale = np.asarray(scale, dtype=np.float64)
+    upper_mass = ndtr(loc / scale)  # P(X > 0) for the untruncated normal
+    return loc - scale * ndtri((1.0 - rng.random(size)) * upper_mass)
+
+
+def calibrate_sigma_prior(
+    tau_loc: float,
+    tau_scale: float,
+    desired_low: float,
+    desired_high: float,
+    num_samples: int = 1000,
+    grid: np.ndarray | None = None,
+    seed: int = 0,
+) -> tuple[float, float]:
+    """Chooses the sigma prior so the implied predictive spread hits a target.
+
+    Reimplements ``calc_outputscale_prior`` from the authors' ``priors.py``.
+    Draws ``num_samples`` values of tau from its prior once. Then, for every
+    (m, s) on ``grid`` x ``grid`` (m outer, s inner), draws ``num_samples``
+    values of sigma ~ TruncNormal(0, inf, m, s), computes
+    6 * sqrt(sigma**2 + tau**2), and scores the 20th/50th/80th percentiles
+    against (low, (low + high) / 2, high) by summed absolute error. The first
+    (m, s) achieving the smallest error wins, as with the original strict "<".
+    A seeded generator makes the result deterministic.
+
+    Args:
+        tau_loc: Location of the tau prior.
+        tau_scale: Scale of the tau prior.
+        desired_low: Target 20th percentile of 6 * sqrt(sigma**2 + tau**2).
+        desired_high: Target 80th percentile.
+        num_samples: Monte Carlo samples per grid cell (authors: 1000).
+        grid: Candidate values for both m and s. Defaults to
+            ``SIGMA_PRIOR_GRID``, the authors' ``np.linspace(0.001, 0.05, 100)``.
+        seed: Seed for the Monte Carlo draws.
+
+    Returns:
+        The chosen ``(loc, scale)`` of the sigma prior.
+    """
+    grid = SIGMA_PRIOR_GRID if grid is None else np.asarray(grid, np.float64)
+    rng = np.random.default_rng(seed)
+    tau = _sample_positive_truncnorm(tau_loc, tau_scale, num_samples, rng)
+    desired = np.array([desired_low, 0.5 * (desired_low + desired_high), desired_high])
+    best_dist, best_m, best_s = math.inf, 0.0, 0.0
+    for m in grid:
+        sigma = _sample_positive_truncnorm(
+            m, grid[:, None], (len(grid), num_samples), rng
+        )
+        spread = 6.0 * np.sqrt(sigma**2 + tau**2)
+        quantiles = np.percentile(spread, [20, 50, 80], axis=1).T  # (n_s, 3)
+        dist = np.abs(quantiles - desired).sum(axis=1)
+        j = int(np.argmin(dist))
+        if dist[j] < best_dist:
+            best_dist, best_m, best_s = float(dist[j]), float(m), float(grid[j])
+    return best_m, best_s
+
+
 @dataclass(frozen=True)
 class APExGPPriors:
     """Priors on the GP hyperparameters eta = {tau, sigma, lengthscale, epsilon}.
 
     Lengthscale, sigma and tau get Normal(loc, scale) priors truncated to
-    (0, infinity). Epsilon gets Uniform(epsilon_min, 1 - max observed AUROC).
+    (0, infinity); epsilon gets Uniform(epsilon_min, 1 - max observed AUROC).
     The mean-function parameters theta have no prior, only box constraints.
 
+    By default the sigma prior is data-dependent, as in the authors' code: at
+    fit time ``calibrate_sigma_prior`` picks (loc, scale) so that the 20th and
+    80th percentiles of 6 * sqrt(sigma**2 + tau**2) under the priors land near
+    ``sigma_low_fraction`` and ``sigma_high_fraction`` times the headroom
+    (1 - epsilon_min) - max(y). Set both ``sigma_loc`` and ``sigma_scale`` to
+    use a fixed prior instead.
+
     Attributes:
-        lengthscale_loc: Lengthscale prior location (paper: -1.23).
-        lengthscale_scale: Lengthscale prior scale (paper: 2.14).
-        sigma_loc: Output-scale prior location. Not reported in the paper
-            (grid-searched there); the default is a placeholder.
-        sigma_scale: Output-scale prior scale (placeholder, see above).
-        tau_loc: Noise prior location. Not reported in the paper; the
-            default keeps tau away from 0 and puts little mass above ~0.03.
-        tau_scale: Noise prior scale (placeholder, see above).
-        epsilon_min: Lower bound of the epsilon prior (paper: 0).
+        lengthscale_loc: Lengthscale prior location, in log10-size units.
+        lengthscale_scale: Lengthscale prior scale. The authors' code uses
+            2.12; the paper's appendix reports 2.14.
+        tau_loc: Noise (tau) prior location.
+        tau_scale: Noise (tau) prior scale.
+        epsilon_min: Lower bound of the epsilon prior.
+        sigma_loc: Fixed sigma prior location, or None for data-dependent.
+        sigma_scale: Fixed sigma prior scale, or None for data-dependent.
+        sigma_low_fraction: Headroom fraction targeted by the 20th percentile.
+        sigma_high_fraction: Headroom fraction targeted by the 80th percentile.
+        sigma_calibration_samples: Monte Carlo samples per grid cell.
+        sigma_calibration_seed: Seed making the calibration deterministic.
     """
 
     lengthscale_loc: float = -1.23
-    lengthscale_scale: float = 2.14
-    sigma_loc: float = 0.01
-    sigma_scale: float = 0.02
+    lengthscale_scale: float = 2.12
     tau_loc: float = 0.01
     tau_scale: float = 0.01
     epsilon_min: float = 0.0
+    sigma_loc: float | None = None
+    sigma_scale: float | None = None
+    sigma_low_fraction: float = 0.5
+    sigma_high_fraction: float = 0.75
+    sigma_calibration_samples: int = 1000
+    sigma_calibration_seed: int = 0
+
+    def __post_init__(self) -> None:
+        """Validates that the fixed sigma prior is fully specified or absent."""
+        if (self.sigma_loc is None) != (self.sigma_scale is None):
+            raise ValueError("Set both sigma_loc and sigma_scale, or neither.")
 
 
 @dataclass(frozen=True)
@@ -287,9 +403,9 @@ class APExGPHyperparameters:
         epsilon: Saturation gap of the mean function.
         theta1: First mean-function parameter.
         theta2: Second mean-function parameter.
-        sigma: Kernel output scale.
-        lengthscale: Kernel lengthscale (log-size units).
-        tau: Observation noise standard deviation.
+        sigma: Kernel output scale (sqrt of gpytorch's outputscale).
+        lengthscale: Kernel lengthscale (log10-size units).
+        tau: Observation noise standard deviation (>= 0.01).
     """
 
     epsilon: float
@@ -318,18 +434,22 @@ def initial_hyperparameters(
     aurocs: np.ndarray,
     mean_function: MeanFunctionName,
     priors: APExGPPriors,
+    sigma: float = 0.01,
 ) -> APExGPHyperparameters:
-    """Data-driven starting point for the MAP optimization.
+    """Data-driven starting point, used for restart 1 of the MAP optimization.
 
     Epsilon starts at the midpoint of its prior support. Theta comes from a
     linear least-squares fit in a linearizing transform of the mean function
     (log-log for the power law, tan for arctan), clipped to the constraints.
+    Sigma starts at the given value (``fit`` passes the sigma prior's loc), tau
+    just above its 0.01 floor, and the lengthscale at gpytorch's default.
 
     Args:
         sizes: Pilot sizes, shape (R,).
         aurocs: Pilot AUROCs, shape (R,).
         mean_function: "power_law" or "arctan".
         priors: Prior configuration (for epsilon_min).
+        sigma: Initial kernel output scale (> 0).
 
     Returns:
         Initial hyperparameters satisfying all constraints.
@@ -356,9 +476,9 @@ def initial_hyperparameters(
         epsilon=epsilon,
         theta1=theta1,
         theta2=theta2,
-        sigma=max(float(np.std(aurocs)), 0.01),
-        lengthscale=1.0,
-        tau=0.01,
+        sigma=max(sigma, 1e-4),
+        lengthscale=math.log(2.0),  # gpytorch default, softplus(0)
+        tau=0.0125,
     )
 
 
@@ -378,40 +498,56 @@ class APExGPRegressor:
     """MAP-fitted GP over learning curves (the APEx-GP core, no PyHealth needed).
 
     All six quantities are optimized jointly with Adam on an unconstrained
-    vector ``raw`` (float64):
+    float64 vector ``raw``, mirroring the gpytorch constraints in the authors'
+    code:
 
-    - epsilon = epsilon_min + width * sigmoid(raw[0])
-    - theta1 = softplus(raw[1])
-    - theta2 = -sigmoid(raw[2]) (power law) or softplus(raw[2]) (arctan)
-    - sigma, lengthscale, tau = softplus(raw[i]) + 1e-6
+    - epsilon = epsilon_min + width * sigmoid(raw[0])  (Interval)
+    - theta1 = softplus(raw[1])  (Positive)
+    - theta2 = -1 + sigmoid(raw[2]) (power law, Interval(-1, 0)) or
+      softplus(raw[2]) (arctan, Positive)
+    - sigma**2 = softplus(raw[3])  (outputscale, Positive)
+    - lengthscale = softplus(raw[4]) + 1e-6  (Positive; tiny floor added)
+    - tau**2 = 1e-4 + softplus(raw[5])  (noise, GreaterThan(1e-4))
 
-    The objective is log p(y | x) + log p(eta) in the constrained space (no
-    Jacobian term), i.e. MAP in the paper's parameterization.
+    Priors are evaluated on sigma, lengthscale and tau. The objective is
+    log p(y | x) + log p(eta) in the constrained space (no Jacobian term).
+
+    Restart 0 starts from ``raw = 0`` (the authors' initialization), restart 1
+    from ``initial_hyperparameters`` (sigma at the sigma prior's loc), and any
+    later restarts from ``raw = 0`` plus Gaussian noise. The restart with the
+    highest log posterior is kept. With the default lr=0.01, restart 0 needs
+    up to ~16-20k iterations; restart 1 typically stops early after ~2-4k.
 
     Args:
         mean_function: "power_law" (default) or "arctan".
         priors: Prior configuration. Defaults to ``APExGPPriors()``.
-        lr: Adam learning rate.
-        n_iterations: Adam iterations per restart.
-        n_restarts: Number of restarts; restart 0 starts at the data-driven
-            initialization, later ones add Gaussian noise to it.
-        restart_scale: Std of the noise added to ``raw`` for restarts.
+        lr: Adam learning rate (authors: 0.01).
+        n_iterations: Maximum Adam iterations per restart.
+        n_restarts: Number of restarts (see above).
+        restart_scale: Std of the noise added to ``raw`` for restarts >= 2.
+        tol: Minimum log-posterior gain that counts as progress.
+        patience: Stop a restart after this many iterations without progress.
         jitter: Initial Cholesky jitter.
         seed: Seed for restart noise.
 
     Attributes:
         hyperparameters_: Fitted ``APExGPHyperparameters`` (after ``fit``).
         log_posterior_: Unnormalized log posterior at the optimum.
+        sigma_prior_loc_: Location of the sigma prior used in the fit.
+        sigma_prior_scale_: Scale of the sigma prior used in the fit.
+        n_iterations_run_: Adam iterations used by each restart.
     """
 
     def __init__(
         self,
         mean_function: MeanFunctionName = "power_law",
         priors: APExGPPriors | None = None,
-        lr: float = 0.05,
-        n_iterations: int = 1500,
-        n_restarts: int = 5,
-        restart_scale: float = 0.5,
+        lr: float = 0.01,
+        n_iterations: int = DEFAULT_N_ITERATIONS,
+        n_restarts: int = 2,
+        restart_scale: float = 1.0,
+        tol: float = 1e-6,
+        patience: int = 500,
         jitter: float = 1e-8,
         seed: int = 0,
     ) -> None:
@@ -420,18 +556,23 @@ class APExGPRegressor:
                 f"mean_function must be one of {sorted(MEAN_FUNCTIONS)}; "
                 f"got {mean_function!r}."
             )
-        if n_restarts < 1 or n_iterations < 1:
-            raise ValueError("n_restarts and n_iterations must be >= 1.")
+        if n_restarts < 1 or n_iterations < 1 or patience < 1:
+            raise ValueError("n_restarts, n_iterations and patience must be >= 1.")
         self.mean_function = mean_function
         self.priors = priors if priors is not None else APExGPPriors()
         self.lr = lr
         self.n_iterations = n_iterations
         self.n_restarts = n_restarts
         self.restart_scale = restart_scale
+        self.tol = tol
+        self.patience = patience
         self.jitter = jitter
         self.seed = seed
         self.hyperparameters_: APExGPHyperparameters | None = None
         self.log_posterior_: float | None = None
+        self.sigma_prior_loc_: float | None = None
+        self.sigma_prior_scale_: float | None = None
+        self.n_iterations_run_: list[int] = []
         self._x_train: torch.Tensor | None = None
         self._y_train: torch.Tensor | None = None
         self._epsilon_width: float = 1.0
@@ -447,30 +588,30 @@ class APExGPRegressor:
             Dict of scalar tensors keyed by ``_PARAM_NAMES``.
         """
         if self.mean_function == "power_law":
-            theta2 = -torch.sigmoid(raw[2])
+            theta2 = -1.0 + torch.sigmoid(raw[2])
         else:
             theta2 = F.softplus(raw[2])
+        epsilon = self.priors.epsilon_min + self._epsilon_width * torch.sigmoid(raw[0])
         return {
-            "epsilon": self.priors.epsilon_min
-            + self._epsilon_width * torch.sigmoid(raw[0]),
+            "epsilon": epsilon,
             "theta1": F.softplus(raw[1]),
             "theta2": theta2,
-            "sigma": F.softplus(raw[3]) + _MIN_POSITIVE,
-            "lengthscale": F.softplus(raw[4]) + _MIN_POSITIVE,
-            "tau": F.softplus(raw[5]) + _MIN_POSITIVE,
+            "sigma": torch.sqrt(F.softplus(raw[3])),
+            "lengthscale": F.softplus(raw[4]) + _LENGTHSCALE_FLOOR,
+            "tau": torch.sqrt(NOISE_VARIANCE_FLOOR + F.softplus(raw[5])),
         }
 
     def _unconstrain(self, hp: APExGPHyperparameters) -> torch.Tensor:
         """Inverse of ``_constrain``.
 
         Args:
-            hp: Constrained hyperparameters.
+            hp: Constrained hyperparameters (tau must exceed 0.01).
 
         Returns:
             Unconstrained float64 vector, shape (6,).
         """
         if self.mean_function == "power_law":
-            raw_theta2 = _logit(-hp.theta2)
+            raw_theta2 = _logit(hp.theta2 + 1.0)
         else:
             raw_theta2 = _softplus_inverse(hp.theta2)
         eps_frac = (hp.epsilon - self.priors.epsilon_min) / self._epsilon_width
@@ -478,11 +619,34 @@ class APExGPRegressor:
             _logit(eps_frac),
             _softplus_inverse(hp.theta1),
             raw_theta2,
-            _softplus_inverse(hp.sigma - _MIN_POSITIVE),
-            _softplus_inverse(hp.lengthscale - _MIN_POSITIVE),
-            _softplus_inverse(hp.tau - _MIN_POSITIVE),
+            _softplus_inverse(hp.sigma**2),
+            _softplus_inverse(hp.lengthscale - _LENGTHSCALE_FLOOR),
+            _softplus_inverse(hp.tau**2 - NOISE_VARIANCE_FLOOR),
         ]
         return torch.tensor(values, dtype=torch.float64)
+
+    def _set_sigma_prior(self, max_auroc: float) -> None:
+        """Fixes the sigma prior for this fit (data-dependent unless overridden).
+
+        Args:
+            max_auroc: Largest observed pilot AUROC.
+        """
+        pr = self.priors
+        if pr.sigma_loc is not None and pr.sigma_scale is not None:
+            self.sigma_prior_loc_, self.sigma_prior_scale_ = (
+                pr.sigma_loc,
+                pr.sigma_scale,
+            )
+            return
+        headroom = (1.0 - pr.epsilon_min) - max_auroc
+        self.sigma_prior_loc_, self.sigma_prior_scale_ = calibrate_sigma_prior(
+            pr.tau_loc,
+            pr.tau_scale,
+            desired_low=pr.sigma_low_fraction * headroom,
+            desired_high=pr.sigma_high_fraction * headroom,
+            num_samples=pr.sigma_calibration_samples,
+            seed=pr.sigma_calibration_seed,
+        )
 
     # -------------------------------------------------------------- objective
     def log_prior(self, params: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -493,13 +657,20 @@ class APExGPRegressor:
 
         Returns:
             Scalar log prior (theta contributes nothing).
+
+        Raises:
+            RuntimeError: If the sigma prior has not been set by ``fit``.
         """
+        if self.sigma_prior_loc_ is None or self.sigma_prior_scale_ is None:
+            raise RuntimeError("Sigma prior not set; call fit().")
         pr = self.priors
         return (
             truncated_normal_log_prob(
                 params["lengthscale"], pr.lengthscale_loc, pr.lengthscale_scale
             )
-            + truncated_normal_log_prob(params["sigma"], pr.sigma_loc, pr.sigma_scale)
+            + truncated_normal_log_prob(
+                params["sigma"], self.sigma_prior_loc_, self.sigma_prior_scale_
+            )
             + truncated_normal_log_prob(params["tau"], pr.tau_loc, pr.tau_scale)
             - math.log(self._epsilon_width)  # Uniform density on its support
         )
@@ -527,8 +698,11 @@ class APExGPRegressor:
 
     def _optimize(
         self, start: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-    ) -> tuple[torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, float, int]:
         """Runs Adam from ``start`` and returns the best iterate.
+
+        Stops early once ``patience`` consecutive iterations improve the best
+        log posterior by no more than ``tol``.
 
         Args:
             start: Initial unconstrained vector, shape (6,).
@@ -536,13 +710,16 @@ class APExGPRegressor:
             y: Pilot AUROCs.
 
         Returns:
-            A tuple ``(best_raw, best_objective)``; objective is -inf if every
-            evaluation failed.
+            A tuple ``(best_raw, best_objective, iterations_run)``; the
+            objective is -inf if every evaluation failed.
         """
         raw = nn.Parameter(start.clone())
         optimizer = torch.optim.Adam([raw], lr=self.lr)
         best_raw, best_obj = start.clone(), -math.inf
+        stale = 0
+        iterations = 0
         for _ in range(self.n_iterations + 1):
+            iterations += 1
             optimizer.zero_grad()
             try:
                 objective = self.log_posterior(raw, x, y)
@@ -550,11 +727,16 @@ class APExGPRegressor:
                 break
             if not torch.isfinite(objective):
                 break
-            if objective.item() > best_obj:
-                best_obj, best_raw = objective.item(), raw.detach().clone()
+            value = objective.item()
+            gain = value - best_obj
+            if gain > 0:
+                best_obj, best_raw = value, raw.detach().clone()
+            stale = 0 if gain > self.tol else stale + 1
+            if stale >= self.patience:
+                break
             (-objective).backward()
             optimizer.step()
-        return best_raw, best_obj
+        return best_raw, best_obj, iterations
 
     # ------------------------------------------------------------- public API
     def fit(
@@ -580,23 +762,38 @@ class APExGPRegressor:
         if np.any(x_np <= 0) or np.any((y_np < 0) | (y_np > 1)):
             raise ValueError("sizes must be > 0 and aurocs within [0, 1].")
 
-        self._epsilon_width = epsilon_upper_width(
-            float(y_np.max()), self.priors.epsilon_min
-        )
+        max_auroc = float(y_np.max())
+        self._epsilon_width = epsilon_upper_width(max_auroc, self.priors.epsilon_min)
+        self._set_sigma_prior(max_auroc)
         x = torch.as_tensor(x_np, dtype=torch.float64)
         y = torch.as_tensor(y_np, dtype=torch.float64)
-        init = initial_hyperparameters(x_np, y_np, self.mean_function, self.priors)
-        raw_init = self._unconstrain(init)
 
         generator = torch.Generator().manual_seed(self.seed)
         best_raw, best_obj = None, -math.inf
+        self.n_iterations_run_ = []
         for restart in range(self.n_restarts):
-            start = raw_init.clone()
-            if restart > 0:
-                noise = torch.randn(6, generator=generator, dtype=torch.float64)
-                start = start + self.restart_scale * noise
-            raw, obj = self._optimize(start, x, y)
-            logger.debug("APEx-GP restart %d: log posterior %.4f", restart, obj)
+            if restart == 1:
+                init = initial_hyperparameters(
+                    x_np,
+                    y_np,
+                    self.mean_function,
+                    self.priors,
+                    sigma=self.sigma_prior_loc_,
+                )
+                start = self._unconstrain(init)
+            else:
+                start = torch.zeros(6, dtype=torch.float64)  # authors' init
+                if restart >= 2:
+                    noise = torch.randn(6, generator=generator, dtype=torch.float64)
+                    start = start + self.restart_scale * noise
+            raw, obj, n_run = self._optimize(start, x, y)
+            self.n_iterations_run_.append(n_run)
+            logger.debug(
+                "APEx-GP restart %d: log posterior %.4f after %d iterations",
+                restart,
+                obj,
+                n_run,
+            )
             if obj > best_obj:
                 best_raw, best_obj = raw, obj
         if best_raw is None:
@@ -1061,6 +1258,11 @@ class APExGP(BaseModel):
     batches with the logistic regression trained on the largest pilot subset,
     so ``Trainer.evaluate`` and inference work.
 
+    The authors train a torch logistic regression with weight decay (L-BFGS) on
+    frozen image embeddings without standardization; the scikit-learn L2
+    logistic regression with ``StandardScaler`` used here is an intentional
+    equivalent for tabular features such as EEG band powers.
+
     Note:
         The model has no trainable torch parameters; train it with ``fit()``,
         not ``Trainer.train()``. The fitted GP is a Python attribute and is not
@@ -1077,9 +1279,10 @@ class APExGP(BaseModel):
         group_key: Sample key holding the subject/patient ID used for splits.
         mean_function: GP mean, "power_law" (default) or "arctan".
         priors: GP priors. Defaults to ``APExGPPriors()``.
-        lr: Adam learning rate for the GP MAP fit.
-        n_iterations: Adam iterations per restart.
-        n_restarts: Number of optimizer restarts.
+        lr: Adam learning rate for the GP MAP fit (authors: 0.01).
+        n_iterations: Maximum Adam iterations per restart.
+        n_restarts: Number of optimizer restarts (restart 0 uses the authors'
+            initialization; see ``APExGPRegressor``).
         seed: Base random seed.
 
     Examples:
@@ -1108,9 +1311,9 @@ class APExGP(BaseModel):
         group_key: str = "patient_id",
         mean_function: MeanFunctionName = "power_law",
         priors: APExGPPriors | None = None,
-        lr: float = 0.05,
-        n_iterations: int = 1500,
-        n_restarts: int = 5,
+        lr: float = 0.01,
+        n_iterations: int = DEFAULT_N_ITERATIONS,
+        n_restarts: int = 2,
         seed: int = 0,
     ) -> None:
         super().__init__(dataset)
