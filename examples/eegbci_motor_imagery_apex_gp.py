@@ -32,6 +32,11 @@ ABLATIONS (--ablations; the baseline row is always included)
                     the authors' data-dependent prior. Tests whether the
                     data-dependent prior is what keeps intervals calibrated.
 
+POINT-ESTIMATE BASELINES (always added; the paper compares against these)
+    LS_power_law, LS_arctan: the GP mean functions fitted by least squares to
+    the baseline's pilot AUROCs (same seeds, same classifiers, same epsilon
+    constraint), with no uncertainty. Their coverage/QL/width are "n/a".
+
 HOW TO READ THE RESULTS
     The Markdown table has one row per configuration, aggregated over seeds:
       RMSE          sqrt(mean over seeds of (predicted mean - observed)^2).
@@ -46,8 +51,16 @@ HOW TO READ THE RESULTS
                     (observed - 0.01, observed + 0.01); higher is better.
       width         mean 95% HDI width; coverage must be read together with
                     width (very wide intervals cover trivially).
+      ε at upper / lower
+                    fraction of seeds whose fitted epsilon lies within 1% of
+                    its prior support [epsilon_min, 1 - max pilot AUROC] of
+                    the upper bound (ceiling = best pilot AUROC: the curve is
+                    flat at the pilot level) or the lower bound (ceiling near
+                    1). High rates flag extrapolations driven by the bound.
     The CSV has one row per (configuration, seed) with the pilot AUROCs, the
-    prediction, the observed value, fitted GP hyperparameters and timings.
+    prediction, the observed value, the ceiling diagnostic (max_pilot_auroc,
+    fitted_ceiling, pred_minus_max_pilot, epsilon_at_bound), fitted GP
+    hyperparameters and timings. GP-only columns are empty for LS rows.
 
 USAGE
     Quick check, synthetic data, no downloads (a few minutes):
@@ -147,6 +160,8 @@ from pyhealth.models.apex_gp import (
     APExGPPriors,
     APExGPRegressor,
     draw_nested_subsets,
+    epsilon_at_bound,
+    fit_learning_curve_least_squares,
     fit_logistic_regression,
     split_by_group,
 )
@@ -247,57 +262,70 @@ class LearningCurve:
 class TrialResult:
     """One (configuration, seed) outcome; one CSV row.
 
+    GP-only fields are None for least-squares baseline rows (empty in the CSV).
+
     Attributes:
         config: Configuration name.
         seed: Trial seed.
-        mean_function: GP mean function.
+        method: "gp" or "least_squares".
+        mean_function: Learning-curve mean function.
         pilot_sizes: Pilot sizes, ";"-joined.
         pilot_aurocs: Pilot test AUROCs, ";"-joined.
         n_full: Size of the whole training split.
-        predicted_mean: Mean of the truncated predictive at n_full.
-        lower: Lower bound of the HDI.
-        upper: Upper bound of the HDI.
+        predicted_mean: Point prediction at n_full (GP: truncated mean).
         observed: Test AUROC of the classifier trained on n_full samples.
         error: predicted_mean - observed.
         abs_error: |error|.
-        covered: Whether observed lies in [lower, upper].
-        interval_width: upper - lower.
-        quantized_likelihood: Predictive mass on observed +/- delta.
-        sigma_prior_loc: Location of the sigma prior used.
-        sigma_prior_scale: Scale of the sigma prior used.
+        max_pilot_auroc: Largest pilot AUROC, y' (epsilon <= 1 - y').
         fitted_epsilon: Fitted saturation gap.
-        fitted_sigma: Fitted kernel output scale.
-        fitted_lengthscale: Fitted kernel lengthscale (log10 units).
-        fitted_tau: Fitted noise standard deviation.
-        gp_iterations_run: Adam iterations per restart, ";"-joined.
+        fitted_ceiling: 1 - fitted_epsilon, the curve's asymptote.
+        pred_minus_max_pilot: predicted_mean - max_pilot_auroc.
+        epsilon_at_bound: "upper", "lower" or "none" (within 1% of the
+            epsilon support width of a bound).
         classifier_seconds: Wall time of the classifiers for this seed.
-        gp_seconds: Wall time of the GP fit and prediction.
+        gp_seconds: Wall time of the curve fit and prediction (GP or LS).
+        lower: Lower bound of the HDI (GP only).
+        upper: Upper bound of the HDI (GP only).
+        covered: Whether observed lies in [lower, upper] (GP only).
+        interval_width: upper - lower (GP only).
+        quantized_likelihood: Predictive mass on observed +/- delta (GP only).
+        sigma_prior_loc: Location of the sigma prior used (GP only).
+        sigma_prior_scale: Scale of the sigma prior used (GP only).
+        fitted_sigma: Fitted kernel output scale (GP only).
+        fitted_lengthscale: Fitted kernel lengthscale, log10 units (GP only).
+        fitted_tau: Fitted noise standard deviation (GP only).
+        gp_iterations_run: Adam iterations per restart, ";"-joined (GP only).
     """
 
     config: str
     seed: int
+    method: str
     mean_function: str
     pilot_sizes: str
     pilot_aurocs: str
     n_full: int
     predicted_mean: float
-    lower: float
-    upper: float
     observed: float
     error: float
     abs_error: float
-    covered: bool
-    interval_width: float
-    quantized_likelihood: float
-    sigma_prior_loc: float
-    sigma_prior_scale: float
+    max_pilot_auroc: float
     fitted_epsilon: float
-    fitted_sigma: float
-    fitted_lengthscale: float
-    fitted_tau: float
-    gp_iterations_run: str
+    fitted_ceiling: float
+    pred_minus_max_pilot: float
+    epsilon_at_bound: str
     classifier_seconds: float
     gp_seconds: float
+    lower: float | None = None
+    upper: float | None = None
+    covered: bool | None = None
+    interval_width: float | None = None
+    quantized_likelihood: float | None = None
+    sigma_prior_loc: float | None = None
+    sigma_prior_scale: float | None = None
+    fitted_sigma: float | None = None
+    fitted_lengthscale: float | None = None
+    fitted_tau: float | None = None
+    gp_iterations_run: str | None = None
 
 
 CurveCache = dict[tuple, LearningCurve]
@@ -396,6 +424,55 @@ def measure_learning_curve(
     )
 
 
+def _shared_fields(
+    curve: LearningCurve,
+    config_name: str,
+    method: str,
+    mean_function: str,
+    predicted: float,
+    epsilon: float,
+    epsilon_min: float,
+    seconds: float,
+) -> dict[str, float | int | str]:
+    """Fields common to GP and least-squares rows, incl. the ceiling diagnostic.
+
+    Args:
+        curve: Classifier results for one seed.
+        config_name: Row name.
+        method: "gp" or "least_squares".
+        mean_function: Learning-curve mean function.
+        predicted: Point prediction at ``curve.n_full``.
+        epsilon: Fitted saturation gap.
+        epsilon_min: Lower bound of epsilon.
+        seconds: Fit wall time.
+
+    Returns:
+        Keyword arguments for ``TrialResult``.
+    """
+    max_pilot = float(max(curve.pilot_aurocs))
+    error = predicted - curve.observed_auroc
+    return {
+        "config": config_name,
+        "seed": curve.seed,
+        "method": method,
+        "mean_function": mean_function,
+        "pilot_sizes": ";".join(str(s) for s in curve.pilot_sizes),
+        "pilot_aurocs": ";".join(f"{a:.5f}" for a in curve.pilot_aurocs),
+        "n_full": curve.n_full,
+        "predicted_mean": predicted,
+        "observed": curve.observed_auroc,
+        "error": error,
+        "abs_error": abs(error),
+        "max_pilot_auroc": max_pilot,
+        "fitted_epsilon": epsilon,
+        "fitted_ceiling": 1.0 - epsilon,
+        "pred_minus_max_pilot": predicted - max_pilot,
+        "epsilon_at_bound": epsilon_at_bound(epsilon, max_pilot, epsilon_min),
+        "classifier_seconds": curve.seconds,
+        "gp_seconds": seconds,
+    }
+
+
 def fit_and_score_gp(curve: LearningCurve, config: ExperimentConfig) -> TrialResult:
     """Protocol steps 4, 5 and 7: fit the GP and score its prediction at N_full.
 
@@ -422,33 +499,98 @@ def fit_and_score_gp(curve: LearningCurve, config: ExperimentConfig) -> TrialRes
     )
     hp = gp.hyperparameters_
     predicted, lo, hi = float(mean[0]), float(lower[0]), float(upper[0])
-    error = predicted - curve.observed_auroc
+    shared = _shared_fields(
+        curve,
+        config.name,
+        "gp",
+        config.mean_function,
+        predicted,
+        hp.epsilon,
+        config.priors.epsilon_min,
+        time.perf_counter() - start,
+    )
     return TrialResult(
-        config=config.name,
-        seed=curve.seed,
-        mean_function=config.mean_function,
-        pilot_sizes=";".join(str(s) for s in curve.pilot_sizes),
-        pilot_aurocs=";".join(f"{a:.5f}" for a in curve.pilot_aurocs),
-        n_full=curve.n_full,
-        predicted_mean=predicted,
+        **shared,
         lower=lo,
         upper=hi,
-        observed=curve.observed_auroc,
-        error=error,
-        abs_error=abs(error),
         covered=bool(lo <= curve.observed_auroc <= hi),
         interval_width=hi - lo,
         quantized_likelihood=metrics["quantized_likelihood"],
         sigma_prior_loc=float(gp.sigma_prior_loc_),
         sigma_prior_scale=float(gp.sigma_prior_scale_),
-        fitted_epsilon=hp.epsilon,
         fitted_sigma=hp.sigma,
         fitted_lengthscale=hp.lengthscale,
         fitted_tau=hp.tau,
         gp_iterations_run=";".join(str(n) for n in gp.n_iterations_run_),
-        classifier_seconds=curve.seconds,
-        gp_seconds=time.perf_counter() - start,
     )
+
+
+def fit_and_score_least_squares(
+    curve: LearningCurve, mean_function: str, name: str, epsilon_min: float = 0.0
+) -> TrialResult:
+    """Least-squares point-prediction baseline on the same learning curve.
+
+    Args:
+        curve: Classifier results for one seed (shared with the GP rows).
+        mean_function: "power_law" or "arctan".
+        name: Row name, e.g. "LS_power_law".
+        epsilon_min: Lower bound of epsilon.
+
+    Returns:
+        A ``TrialResult`` whose interval/likelihood fields are None.
+    """
+    start = time.perf_counter()
+    fit = fit_learning_curve_least_squares(
+        curve.pilot_sizes, curve.pilot_aurocs, mean_function, epsilon_min
+    )
+    predicted = float(fit.predict([curve.n_full])[0])
+    return TrialResult(
+        **_shared_fields(
+            curve,
+            name,
+            "least_squares",
+            mean_function,
+            predicted,
+            fit.epsilon,
+            epsilon_min,
+            time.perf_counter() - start,
+        )
+    )
+
+
+def get_learning_curve(
+    features: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    config: ExperimentConfig,
+    seed: int,
+    cache: CurveCache,
+) -> LearningCurve:
+    """Returns the cached learning curve for (seed, schedule), computing it once.
+
+    Args:
+        features: Feature matrix, shape (N, d).
+        labels: Binary labels, shape (N,).
+        groups: Group ID per sample, shape (N,).
+        config: Supplies pilot sizes, split fractions and C grid.
+        seed: Trial seed.
+        cache: Shared cache, updated in place.
+
+    Returns:
+        The ``LearningCurve``.
+    """
+    key = (seed, config.pilot_sizes, config.split_fractions, config.c_grid)
+    if key not in cache:
+        cache[key] = measure_learning_curve(
+            features,
+            labels,
+            groups,
+            config.pilot_sizes,
+            seed,
+            config.split_fractions,
+            config.c_grid,
+        )
+    return cache[key]
 
 
 def run_protocol(
@@ -484,45 +626,97 @@ def run_protocol(
     cache = curve_cache if curve_cache is not None else {}
     results = []
     for seed in seeds:
-        key = (seed, config.pilot_sizes, config.split_fractions, config.c_grid)
-        if key not in cache:
-            cache[key] = measure_learning_curve(
-                features,
-                labels,
-                groups,
-                config.pilot_sizes,
-                seed,
-                config.split_fractions,
-                config.c_grid,
-            )
-        trial = fit_and_score_gp(cache[key], config)
+        curve = get_learning_curve(features, labels, groups, config, seed, cache)
+        trial = fit_and_score_gp(curve, config)
         results.append(trial)
         progress(
             f"  [{config.name}] seed {seed}: predicted {trial.predicted_mean:.3f} "
             f"[{trial.lower:.3f}, {trial.upper:.3f}] at N={trial.n_full}, observed "
             f"{trial.observed:.3f} ({'covered' if trial.covered else 'MISSED'}); "
-            f"GP {trial.gp_seconds:.1f}s"
+            f"epsilon at bound: {trial.epsilon_at_bound}; GP {trial.gp_seconds:.1f}s"
         )
+    return results
+
+
+def run_least_squares_baselines(
+    features: np.ndarray,
+    labels: np.ndarray,
+    groups: np.ndarray,
+    base_config: ExperimentConfig,
+    seeds: Iterable[int],
+    curve_cache: CurveCache | None = None,
+    progress: Callable[[str], None] = print,
+) -> list[TrialResult]:
+    """Adds the LS_power_law and LS_arctan rows on the baseline's curves.
+
+    Uses the learning curves of ``base_config`` (same seeds, pilot sizes and
+    classifiers as the GP baseline), so no new classifiers are trained when
+    the cache is shared.
+
+    Args:
+        features: Feature matrix, shape (N, d).
+        labels: Binary labels, shape (N,).
+        groups: Group ID per sample, shape (N,).
+        base_config: Configuration whose pilot schedule and split are reused.
+        seeds: Trial seeds.
+        curve_cache: Optional shared cache of learning curves.
+        progress: Callable receiving one progress line per trial.
+
+    Returns:
+        Two ``TrialResult`` rows per seed (power law, then arctan).
+    """
+    features = np.asarray(features, dtype=np.float64)
+    labels = np.asarray(labels).astype(np.int64)
+    groups = np.asarray(groups)
+    cache = curve_cache if curve_cache is not None else {}
+    seeds = list(seeds)
+    results = []
+    for mean_function in ("power_law", "arctan"):
+        name = f"LS_{mean_function}"
+        for seed in seeds:
+            curve = get_learning_curve(
+                features, labels, groups, base_config, seed, cache
+            )
+            trial = fit_and_score_least_squares(
+                curve, mean_function, name, base_config.priors.epsilon_min
+            )
+            results.append(trial)
+            progress(
+                f"  [{name}] seed {seed}: predicted {trial.predicted_mean:.3f} at "
+                f"N={trial.n_full}, observed {trial.observed:.3f}; epsilon at "
+                f"bound: {trial.epsilon_at_bound}"
+            )
     return results
 
 
 # =========================================================================== #
 # Reporting
 # =========================================================================== #
-def summarize(results: Sequence[TrialResult]) -> list[dict[str, float | str | int]]:
+def _mean_or_none(values: Sequence[float | bool | None]) -> float | None:
+    """Mean of the values, or None if any is None (metric not applicable)."""
+    if any(v is None for v in values):
+        return None
+    return float(np.mean(values))
+
+
+def summarize(
+    results: Sequence[TrialResult],
+) -> list[dict[str, float | str | int | None]]:
     """Aggregates trial results per configuration (in first-seen order).
 
     Args:
         results: Trial results, possibly from several configurations.
 
     Returns:
-        One dict per configuration with the table's columns.
+        One dict per configuration with the table's columns; interval metrics
+        are None for least-squares rows.
     """
     order = list(dict.fromkeys(r.config for r in results))
     rows = []
     for name in order:
         trials = [r for r in results if r.config == name]
         err = np.array([t.error for t in trials])
+        bounds = [t.epsilon_at_bound for t in trials]
         rows.append(
             {
                 "config": name,
@@ -536,18 +730,25 @@ def summarize(results: Sequence[TrialResult]) -> list[dict[str, float | str | in
                 if len(err) > 1
                 else 0.0,
                 "bias": float(np.mean(err)),
-                "coverage": float(np.mean([t.covered for t in trials])),
-                "quantized_likelihood": float(
-                    np.mean([t.quantized_likelihood for t in trials])
+                "coverage": _mean_or_none([t.covered for t in trials]),
+                "quantized_likelihood": _mean_or_none(
+                    [t.quantized_likelihood for t in trials]
                 ),
-                "interval_width": float(np.mean([t.interval_width for t in trials])),
+                "interval_width": _mean_or_none([t.interval_width for t in trials]),
                 "mean_observed": float(np.mean([t.observed for t in trials])),
+                "epsilon_upper_rate": bounds.count("upper") / len(bounds),
+                "epsilon_lower_rate": bounds.count("lower") / len(bounds),
             }
         )
     return rows
 
 
-def format_markdown(rows: Sequence[dict[str, float | str | int]]) -> str:
+def _fmt(value: float | None, spec: str) -> str:
+    """Formats a number, or "n/a" for None."""
+    return "n/a" if value is None else format(value, spec)
+
+
+def format_markdown(rows: Sequence[dict[str, float | str | int | None]]) -> str:
     """Formats ``summarize`` output as a Markdown table.
 
     Args:
@@ -558,16 +759,18 @@ def format_markdown(rows: Sequence[dict[str, float | str | int]]) -> str:
     """
     header = (
         "| config | mean fn | pilot sizes | seeds | N_full | observed | RMSE | "
-        "\\|err\\| ± sd | bias | coverage | QL | width |"
+        "\\|err\\| ± sd | bias | coverage | QL | width | eps at upper / lower |"
     )
-    lines = [header, "|" + "---|" * 12]
+    lines = [header, "|" + "---|" * 13]
     for r in rows:
         lines.append(
             f"| {r['config']} | {r['mean_function']} | {r['pilot_sizes']} | "
             f"{r['n_seeds']} | {r['mean_n_full']:.0f} | {r['mean_observed']:.3f} | "
             f"{r['rmse']:.4f} | {r['abs_error_mean']:.4f} ± {r['abs_error_std']:.4f} "
-            f"| {r['bias']:+.4f} | {r['coverage']:.2f} | "
-            f"{r['quantized_likelihood']:.3f} | {r['interval_width']:.3f} |"
+            f"| {r['bias']:+.4f} | {_fmt(r['coverage'], '.2f')} | "
+            f"{_fmt(r['quantized_likelihood'], '.3f')} | "
+            f"{_fmt(r['interval_width'], '.3f')} | "
+            f"{r['epsilon_upper_rate']:.2f} / {r['epsilon_lower_rate']:.2f} |"
         )
     return "\n".join(lines)
 
@@ -874,6 +1077,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             curve_cache=cache,
             progress=lambda line: print(line, flush=True),
         )
+    print("\nLeast-squares baselines on the baseline's learning curves", flush=True)
+    results += run_least_squares_baselines(
+        features,
+        labels,
+        groups,
+        configs[0],
+        seeds,
+        curve_cache=cache,
+        progress=lambda line: print(line, flush=True),
+    )
 
     output = Path(args.output)
     write_csv(results, output)

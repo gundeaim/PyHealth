@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy import stats
-from scipy.optimize import brentq
+from scipy.optimize import brentq, least_squares
 from scipy.special import ndtr, ndtri
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -925,6 +925,8 @@ def truncated_normal_hdi(
     The truncated density is symmetric and decreasing in |x - loc| on its
     support, so the HDI is [loc - c, loc + c] intersected with [low, high],
     with c found by root finding so that the interval holds ``level`` mass.
+    The authors' ``metrics.py`` defines no interval; the 95% interval used for
+    coverage here is this HDI of the [0, 1]-truncated predictive.
 
     Args:
         loc: Untruncated mean.
@@ -978,6 +980,9 @@ def quantized_likelihood(
 ) -> np.ndarray:
     """Probability the truncated predictive assigns to (y* - delta, y* + delta).
 
+    Follows the paper's definition (delta = 0.01); the authors' ``metrics.py``
+    does not define this metric.
+
     Args:
         observed: Observed AUROCs, shape (Q,).
         loc: Untruncated predictive means, shape (Q,).
@@ -1000,7 +1005,10 @@ def quantized_likelihood(
 def interval_coverage(
     observed: np.ndarray, lower: np.ndarray, upper: np.ndarray
 ) -> float:
-    """Fraction of observed values inside [lower, upper].
+    """Fraction of observed values inside [lower, upper], endpoints included.
+
+    Matches the authors' ``metrics.coverage``: inclusive on both ends and
+    averaged over all observations.
 
     Args:
         observed: Observed AUROCs, shape (Q,).
@@ -1009,13 +1017,28 @@ def interval_coverage(
 
     Returns:
         Coverage in [0, 1].
+
+    Raises:
+        ValueError: If the three inputs do not share one shape.
     """
     observed = np.asarray(observed, dtype=np.float64)
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    if not observed.shape == lower.shape == upper.shape:
+        raise ValueError(
+            f"Shapes differ: observed {observed.shape}, lower {lower.shape}, "
+            f"upper {upper.shape}."
+        )
     return float(np.mean((observed >= lower) & (observed <= upper)))
 
 
 def rmse(observed: np.ndarray, predicted: np.ndarray) -> float:
-    """Root-mean-squared error.
+    """Root-mean-squared error over all elements.
+
+    Matches the authors' ``metrics.rmse`` for 1-D inputs, including its
+    equal-shape check. For 2-D inputs theirs returns one RMSE per column
+    (``axis=0``); ours always returns a single scalar, which is how the
+    protocol uses it.
 
     Args:
         observed: Observed values, shape (Q,).
@@ -1023,9 +1046,206 @@ def rmse(observed: np.ndarray, predicted: np.ndarray) -> float:
 
     Returns:
         The RMSE.
+
+    Raises:
+        ValueError: If the shapes differ.
     """
-    diff = np.asarray(observed, np.float64) - np.asarray(predicted, np.float64)
-    return float(np.sqrt(np.mean(diff**2)))
+    observed = np.asarray(observed, dtype=np.float64)
+    predicted = np.asarray(predicted, dtype=np.float64)
+    if observed.shape != predicted.shape:
+        raise ValueError(
+            f"Shapes differ: observed {observed.shape}, predicted {predicted.shape}."
+        )
+    return float(np.sqrt(np.mean((observed - predicted) ** 2)))
+
+
+def epsilon_at_bound(
+    epsilon: float, max_auroc: float, epsilon_min: float = 0.0, tolerance: float = 0.01
+) -> Literal["upper", "lower", "none"]:
+    """Reports whether a fitted epsilon sits at an edge of its prior support.
+
+    The support is [epsilon_min, 1 - max_auroc]. At the upper edge the mean
+    function's ceiling 1 - epsilon equals the best pilot AUROC (the curve is
+    forced flat at the pilot level); at the lower edge the ceiling is
+    1 - epsilon_min (near-perfect AUROC when epsilon_min = 0).
+
+    Args:
+        epsilon: Fitted saturation gap.
+        max_auroc: Largest pilot AUROC, y'.
+        epsilon_min: Lower bound of the epsilon prior.
+        tolerance: Distance from a bound, as a fraction of the support width,
+            that still counts as "at" the bound.
+
+    Returns:
+        "upper", "lower" or "none". If the support is so narrow that both
+        apply, "upper" is returned.
+    """
+    width = epsilon_upper_width(max_auroc, epsilon_min)
+    if epsilon >= epsilon_min + width * (1.0 - tolerance):
+        return "upper"
+    if epsilon <= epsilon_min + width * tolerance:
+        return "lower"
+    return "none"
+
+
+# =========================================================================== #
+# 2b. Least-squares learning-curve baselines (point predictions only)
+# =========================================================================== #
+def learning_curve_mean(
+    sizes: Sequence[float] | np.ndarray,
+    mean_function: MeanFunctionName,
+    epsilon: float,
+    theta1: float,
+    theta2: float,
+) -> np.ndarray:
+    """NumPy version of ``power_law_mean`` / ``arctan_mean``.
+
+    Args:
+        sizes: Training-set sizes.
+        mean_function: "power_law" or "arctan".
+        epsilon: Saturation gap.
+        theta1: First curve parameter.
+        theta2: Second curve parameter.
+
+    Returns:
+        Curve values at ``sizes`` as a float64 array.
+
+    Raises:
+        ValueError: On an unknown mean function.
+    """
+    x = np.asarray(sizes, dtype=np.float64)
+    if mean_function == "power_law":
+        return (1.0 - epsilon) - theta1 * np.power(x, theta2)
+    if mean_function == "arctan":
+        return (2.0 / math.pi) * np.arctan(theta1 * (math.pi / 2.0) * x + theta2) - (
+            epsilon
+        )
+    raise ValueError(f"Unknown mean_function {mean_function!r}.")
+
+
+@dataclass(frozen=True)
+class LeastSquaresFit:
+    """Least-squares learning-curve fit.
+
+    Attributes:
+        mean_function: "power_law" or "arctan".
+        epsilon: Fitted saturation gap.
+        theta1: Fitted first parameter.
+        theta2: Fitted second parameter.
+        mse: Mean squared error on the pilot points.
+        max_auroc: Largest pilot AUROC (sets epsilon's upper bound).
+        epsilon_min: Lower bound used for epsilon.
+    """
+
+    mean_function: str
+    epsilon: float
+    theta1: float
+    theta2: float
+    mse: float
+    max_auroc: float
+    epsilon_min: float
+
+    @property
+    def ceiling(self) -> float:
+        """Asymptotic AUROC, 1 - epsilon."""
+        return 1.0 - self.epsilon
+
+    def predict(self, sizes: Sequence[float] | np.ndarray) -> np.ndarray:
+        """Point predictions at new sizes.
+
+        Args:
+            sizes: Training-set sizes.
+
+        Returns:
+            Predicted AUROCs as a float64 array.
+        """
+        return learning_curve_mean(
+            sizes, self.mean_function, self.epsilon, self.theta1, self.theta2
+        )
+
+
+def fit_learning_curve_least_squares(
+    sizes: Sequence[float] | np.ndarray,
+    aurocs: Sequence[float] | np.ndarray,
+    mean_function: MeanFunctionName = "power_law",
+    epsilon_min: float = 0.0,
+) -> LeastSquaresFit:
+    """Fits a learning curve by minimizing MSE to the pilot AUROCs.
+
+    Same parameterizations and constraints as the GP mean functions:
+    epsilon in [epsilon_min, 1 - max(aurocs)], theta1 >= 0, and theta2 in
+    [-1, 0] (power law) or theta2 >= 0 (arctan). The authors' ``train_PowerLaw``
+    and ``train_Arctan`` minimize the same MSE with Adam on an unconstrained
+    reparameterization; here SciPy's bounded trust-region least squares
+    minimizes it directly (the sum of squared residuals has the same
+    minimizer as the MSE). Two starts are tried and the lower MSE kept: the
+    data-driven ``initial_hyperparameters`` and the authors' raw = 0 point
+    (epsilon at mid-support, theta1 = log 2, theta2 = -0.5 or log 2).
+
+    Args:
+        sizes: Positive pilot sizes, shape (R,), R >= 2.
+        aurocs: Pilot AUROCs in [0, 1], shape (R,).
+        mean_function: "power_law" or "arctan".
+        epsilon_min: Lower bound for epsilon.
+
+    Returns:
+        The ``LeastSquaresFit``.
+
+    Raises:
+        ValueError: On invalid inputs or mean function.
+    """
+    x = np.asarray(sizes, dtype=np.float64).reshape(-1)
+    y = np.asarray(aurocs, dtype=np.float64).reshape(-1)
+    if x.shape != y.shape or len(x) < 2:
+        raise ValueError("sizes and aurocs must be 1-D, equal length, R >= 2.")
+    if np.any(x <= 0) or np.any((y < 0) | (y > 1)):
+        raise ValueError("sizes must be > 0 and aurocs within [0, 1].")
+    if mean_function not in ("power_law", "arctan"):
+        raise ValueError(f"Unknown mean_function {mean_function!r}.")
+
+    max_auroc = float(y.max())
+    eps_max = epsilon_min + epsilon_upper_width(max_auroc, epsilon_min)
+    if mean_function == "power_law":
+        lower = np.array([epsilon_min, 0.0, -1.0])
+        upper = np.array([eps_max, np.inf, 0.0])
+        authors_start = [0.5 * (epsilon_min + eps_max), math.log(2.0), -0.5]
+    else:
+        lower = np.array([epsilon_min, 0.0, 0.0])
+        upper = np.array([eps_max, np.inf, np.inf])
+        authors_start = [0.5 * (epsilon_min + eps_max), math.log(2.0), math.log(2.0)]
+    init = initial_hyperparameters(
+        x, y, mean_function, APExGPPriors(epsilon_min=epsilon_min)
+    )
+    starts = [[init.epsilon, init.theta1, init.theta2], authors_start]
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        return learning_curve_mean(x, mean_function, *params) - y
+
+    best = None
+    for start in starts:
+        result = least_squares(
+            residuals,
+            np.clip(np.asarray(start, dtype=np.float64), lower, upper),
+            bounds=(lower, upper),
+            method="trf",
+            x_scale="jac",
+            ftol=1e-15,
+            xtol=1e-15,
+            gtol=1e-15,
+            max_nfev=20_000,
+        )
+        if best is None or result.cost < best.cost:
+            best = result
+    epsilon, theta1, theta2 = (float(v) for v in best.x)
+    return LeastSquaresFit(
+        mean_function=mean_function,
+        epsilon=epsilon,
+        theta1=theta1,
+        theta2=theta2,
+        mse=float(np.mean(residuals(best.x) ** 2)),
+        max_auroc=max_auroc,
+        epsilon_min=epsilon_min,
+    )
 
 
 # =========================================================================== #
