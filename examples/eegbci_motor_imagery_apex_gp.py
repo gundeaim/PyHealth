@@ -7,8 +7,9 @@ PURPOSE
     the paper's images. Task: rest (T0) vs imagined movement (T1/T2) in the
     PhysioNet EEG Motor Movement/Imagery dataset (EEGBCI), imagery runs 4, 6,
     8, 10, 12, 14. Features: 16 channels x 5 log band powers = 80 per 2 s
-    window (``eegbci_features.build_feature_matrix``). Classifier: L2 logistic
-    regression with C tuned on validation AUROC.
+    window, computed by ``pyhealth.processors.BandPowerProcessor`` inside
+    ``build_feature_matrix``. Classifier: L2 logistic regression with C tuned
+    on validation AUROC.
 
 PROTOCOL (one trial per seed; every configuration uses the same seeds)
     1. Split subjects 60/20/20 into train/val/test (subject-disjoint).
@@ -160,15 +161,17 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import sys
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
+import torch
 from sklearn.metrics import roc_auc_score
 
+from pyhealth.processors import BandPowerProcessor
+from pyhealth.processors.band_power_processor import DEFAULT_BANDS
 from pyhealth.models.apex_gp import (
     DEFAULT_C_GRID,
     DEFAULT_N_ITERATIONS,
@@ -182,16 +185,14 @@ from pyhealth.models.apex_gp import (
     split_by_group,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-from eegbci_features import (  # noqa: E402
-    MOTOR_IMAGERY_RUNS,
-    build_feature_matrix,
-    make_synthetic_samples,
-)
 
 logger = logging.getLogger("apex_gp_experiment")
+
+MOTOR_IMAGERY_RUNS: frozenset[int] = frozenset({4, 6, 8, 10, 12, 14})
+"""EEGBCI runs in which the subject imagines (rather than executes) movement."""
+
+EVENT_CODE_TO_BINARY: dict[str, int] = {"T0": 0, "T1": 1, "T2": 1}
+"""Binary label from the EDF annotation code: rest = 0, imagined movement = 1."""
 
 PAPER_SIZES: tuple[int, ...] = tuple(DEFAULT_SUBSET_SIZES)
 SMALL_SIZES: tuple[int, ...] = (30, 47, 74, 115, 180)
@@ -869,6 +870,220 @@ def build_configs(
             )
         )
     return configs
+
+
+# =========================================================================== #
+# EEGBCI task helpers (task-specific; the processor stays task-agnostic)
+# =========================================================================== #
+def _to_scalar(value: object) -> object:
+    """Unwraps 0-d tensors/arrays to Python scalars; returns others unchanged.
+
+    Args:
+        value: A scalar, 0-d tensor or 0-d array.
+
+    Returns:
+        A plain Python scalar when ``value`` is 0-d, otherwise ``value``.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.item()
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return value.item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def event_code_to_binary(event_code: str) -> int:
+    """Maps an EEGBCI annotation code to the binary rest/imagery label.
+
+    Args:
+        event_code: The sample's ``event_code`` ("T0", "T1" or "T2").
+
+    Returns:
+        0 for rest ("T0"), 1 for imagined movement ("T1" or "T2").
+
+    Raises:
+        ValueError: If ``event_code`` is not one of the known codes.
+    """
+    code = str(_to_scalar(event_code)).strip().upper()
+    try:
+        return EVENT_CODE_TO_BINARY[code]
+    except KeyError as err:
+        raise ValueError(
+            f"Unknown event_code {event_code!r}; expected one of "
+            f"{sorted(EVENT_CODE_TO_BINARY)}."
+        ) from err
+
+
+def filter_motor_imagery(
+    samples: Iterable[Mapping[str, object]],
+    runs: Iterable[int] = MOTOR_IMAGERY_RUNS,
+) -> list[Mapping[str, object]]:
+    """Keeps only windows recorded during motor-imagery runs.
+
+    Filtering uses the integer ``run`` field, not ``label_family`` (which is
+    "motor_imagery" for rest windows too) or ``run_type``.
+
+    Args:
+        samples: Iterable of PyHealth sample dicts (e.g. a ``SampleDataset``).
+        runs: Run numbers to keep. Defaults to the six imagery runs.
+
+    Returns:
+        A list of the samples whose ``run`` is in ``runs``.
+    """
+    keep = {int(r) for r in runs}
+    return [s for s in samples if int(_to_scalar(s["run"])) in keep]
+
+
+def build_feature_matrix(
+    samples: Iterable[Mapping[str, object]],
+    bands: Mapping[str, tuple[float, float]] = DEFAULT_BANDS,
+    runs: Iterable[int] = MOTOR_IMAGERY_RUNS,
+    nperseg: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Builds the feature matrix, binary labels and subject groups.
+
+    Features come from ``BandPowerProcessor`` (float64 output, one processor
+    per distinct sample rate), so they are identical to the earlier
+    stand-alone ``compute_log_band_power``.
+
+    Args:
+        samples: Iterable of sample dicts from ``EEGMotorImageryEEGBCI``.
+        bands: Mapping from band name to (low, high) in Hz.
+        runs: Runs to keep. Defaults to the six motor-imagery runs.
+        nperseg: Welch segment length; see ``BandPowerProcessor``.
+
+    Returns:
+        A tuple ``(X, y, groups)`` where ``X`` has shape
+        (n_windows, n_channels * n_bands), ``y`` is an int64 array of 0/1
+        labels and ``groups`` holds each window's ``subject_id``.
+
+    Raises:
+        ValueError: If no samples remain after filtering, or windows disagree
+            on channel count or channel names.
+    """
+    kept = filter_motor_imagery(samples, runs)
+    if not kept:
+        raise ValueError("No samples left after filtering to imagery runs.")
+
+    processors: dict[float, BandPowerProcessor] = {}
+    ref_channels = list(kept[0].get("channel_names", []))
+    rows, labels, groups = [], [], []
+    for sample in kept:
+        channels = list(sample.get("channel_names", []))
+        if ref_channels and channels and channels != ref_channels:
+            raise ValueError(
+                f"Channel mismatch in {sample.get('trial_id')}: {channels} "
+                f"!= {ref_channels}."
+            )
+        rate = float(_to_scalar(sample["sample_rate"]))
+        if rate not in processors:
+            processors[rate] = BandPowerProcessor(
+                sample_rate=rate, bands=bands, nperseg=nperseg, dtype=torch.float64
+            )
+        features = np.asarray(processors[rate].process(sample["signal"]))
+        if rows and features.shape != rows[0].shape:
+            raise ValueError(
+                f"Feature length mismatch in {sample.get('trial_id')}: "
+                f"{features.shape} != {rows[0].shape}."
+            )
+        rows.append(features)
+        labels.append(event_code_to_binary(sample["event_code"]))
+        groups.append(_to_scalar(sample["subject_id"]))
+
+    return (
+        np.vstack(rows),
+        np.asarray(labels, dtype=np.int64),
+        np.asarray(groups),
+    )
+
+
+CHANNEL_NAMES: list[str] = [
+    "FC5", "FC3", "FC1", "FC2", "FC4", "FC6", "C5", "C3",
+    "C1", "C2", "C4", "C6", "CP5", "CP3", "CP4", "CP6",
+]  # fmt: skip
+
+_EEGBCI_LABEL = {  # (run, event_code) -> eegbci_label, for realistic dicts
+    **{(r, "T0"): 0 for r in range(1, 15)},
+    **{(r, "T1"): 3 for r in (4, 8, 12)},
+    **{(r, "T2"): 4 for r in (4, 8, 12)},
+    **{(r, "T1"): 7 for r in (6, 10, 14)},
+    **{(r, "T2"): 8 for r in (6, 10, 14)},
+    **{(r, "T1"): 1 for r in (3, 7, 11)},
+    **{(r, "T2"): 2 for r in (3, 7, 11)},
+}
+
+
+def make_synthetic_samples(
+    n_subjects: int = 10,
+    runs: Sequence[int] = (3, 4, 6),
+    windows_per_run: int = 60,
+    sample_rate: float = 200.0,
+    seed: int = 0,
+    rest_mu_amplitude: float = 1.0,
+    imagery_mu_amplitude: float = 0.4,
+    subject_variability: float = 0.0,
+) -> list[dict[str, object]]:
+    """Creates fake EEGBCI sample dicts with the same keys and shapes.
+
+    Rest windows carry a stronger 10 Hz (mu) rhythm than imagery windows,
+    mimicking event-related desynchronisation, so a classifier can learn.
+    Run 3 is motor execution and should be dropped by the filter. The default
+    amplitudes make the task nearly trivial; closer amplitudes plus subject
+    variability give a gradual learning curve.
+
+    Args:
+        n_subjects: Number of synthetic subjects.
+        runs: Run numbers to generate.
+        windows_per_run: Windows per run (half T0, a quarter each T1/T2).
+        sample_rate: Sampling rate in Hz.
+        seed: Seed for the random signals.
+        rest_mu_amplitude: 10 Hz amplitude in rest (T0) windows.
+        imagery_mu_amplitude: 10 Hz amplitude in imagery (T1/T2) windows.
+        subject_variability: Std of each subject's per-channel log gain, which
+            scales that subject's whole signal (a nuisance that hurts
+            cross-subject generalization). 0 disables it.
+
+    Returns:
+        A list of sample dicts whose array fields are torch tensors.
+    """
+    rng = np.random.default_rng(seed)
+    n_times = int(2.0 * sample_rate)
+    t = np.arange(n_times) / sample_rate
+    wrap = torch.as_tensor
+    codes = ["T0", "T1", "T0", "T2"]
+    samples = []
+    for subj in range(1, n_subjects + 1):
+        gain = np.exp(rng.normal(0.0, subject_variability, size=(16, 1)))
+        for run in runs:
+            for w in range(windows_per_run):
+                code = codes[w % 4]
+                mu_amp = rest_mu_amplitude if code == "T0" else imagery_mu_amplitude
+                phase = rng.uniform(0, 2 * np.pi, size=(16, 1))
+                sig = rng.standard_normal((16, n_times)) * 0.5
+                sig += mu_amp * np.sin(2 * np.pi * 10.0 * t + phase)
+                sig *= gain
+                samples.append({
+                    "patient_id": f"S{subj:03d}",
+                    "record_id": f"R{run:02d}",
+                    "subject_id": subj,
+                    "run": run,
+                    "run_type": "synthetic",
+                    "signal_file": f"S{subj:03d}R{run:02d}.edf",
+                    "trial_id": f"S{subj:03d}_R{run:02d}_{w:04d}",
+                    "event_code": code,
+                    "task_label": "rest" if code == "T0" else "imagery",
+                    "label_family": "motor_imagery",
+                    "label": wrap(np.array(2 if code == "T0" else 0)),
+                    "eegbci_label": _EEGBCI_LABEL[(run, code)],
+                    "signal": wrap(sig.astype(np.float32)),
+                    "channel_names": list(CHANNEL_NAMES),
+                    "start_time": 2.0 * w,
+                    "end_time": 2.0 * w + 2.0,
+                    "sample_rate": sample_rate,
+                    "stft": wrap(np.zeros((16, 100, 3), dtype=np.float32)),
+                })  # fmt: skip
+    return samples
 
 
 # =========================================================================== #

@@ -87,6 +87,7 @@ from .unified_bridge import (
     transform_batch,
     transform_processor,
 )
+from .band_power_processor import BandPowerProcessor
 
 # Expose public API
 from .base_processor import (
@@ -150,4 +151,5 @@ __all__ = [
     "ConceptVocab",
     "EthosProcessor",
     "EthosContextProcessor",
+    "BandPowerProcessor",
 ]
