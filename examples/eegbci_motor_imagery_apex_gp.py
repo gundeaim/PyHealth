@@ -77,40 +77,56 @@ USAGE
 
 RESULTS (full run on all 109 subjects, 10 seeds)
     Setup: 109/109 subjects loaded, 38,895 windows x 80 features (19,220 rest /
-    19,675 imagery); GP up to 20,000 Adam iterations, 2 restarts; 34.2 min.
-    N_full = training split = ~23,160 windows per seed, about 64x the largest
-    paper pilot (360). Mean observed AUROC at N_full: 0.622 (same in all rows).
-    baseline, A and C share each seed's classifiers (identical pilot and
-    observed AUROCs), so their differences come from the GP alone.
+    19,675 imagery); GP up to 20,000 Adam iterations, 2 restarts; 34.2 min for
+    the GP configurations. N_full = training split = ~23,160 windows per seed,
+    about 64x the largest paper pilot (360). Mean observed AUROC at N_full:
+    0.622 (same in all rows). baseline, A, C and both LS rows share each
+    seed's classifiers (identical pilot and observed AUROCs), so their
+    differences come from the curve fit alone. Two full runs with the same
+    seeds gave identical GP rows; the second added the LS rows and eps column.
 
-    config          pilots    RMSE   |err| ± sd      bias     cov   QL     width
-    baseline        60-360    0.042  0.035 ± 0.025   +0.018   0.90  0.142  0.130
-    A_arctan        60-360    0.213  0.167 ± 0.140   +0.159   0.40  0.087  0.121
-    B_small         30-180    0.058  0.051 ± 0.029   -0.015   0.80  0.096  0.142
-    B_large         120-720   0.030  0.022 ± 0.021   +0.010   0.90  0.190  0.120
-    C_fixed_prior   60-360    0.040  0.031 ± 0.026   +0.018   0.50  0.186  0.054
+    config          pilots   RMSE   |err| ± sd     bias    cov   QL     width  eps u/l
+    baseline        60-360   0.042  0.035 ± 0.025  +0.018  0.90  0.142  0.130  0.0/0.5
+    A_arctan        60-360   0.213  0.167 ± 0.140  +0.159  0.40  0.087  0.121  0.0/0.3
+    B_small         30-180   0.058  0.051 ± 0.029  -0.015  0.80  0.096  0.142  0.1/0.4
+    B_large         120-720  0.030  0.022 ± 0.021  +0.010  0.90  0.190  0.120  0.0/0.1
+    C_fixed_prior   60-360   0.040  0.031 ± 0.026  +0.018  0.50  0.186  0.054  0.0/0.2
+    LS_power_law    60-360   0.039  0.030 ± 0.027  +0.018  n/a   n/a    n/a    0.0/0.7
+    LS_arctan       60-360   0.220  0.173 ± 0.144  +0.167  n/a   n/a    n/a    0.0/0.4
+    (eps u/l: fraction of seeds with fitted epsilon at its upper / lower bound.)
 
     1. Baseline: 64x extrapolation with RMSE 0.042 and a slight optimistic
        bias (+0.018). It covered 9 of 10 seeds, consistent with nominal 95%
        (10 seeds cannot tell 0.90 from 0.95), but at a cost: the 95% intervals
        average 0.13 wide.
-    2. Arctan mean (A) is unreliable here: in 6 of 10 seeds it predicted
-       0.80-0.96 against an observed ~0.62, giving 5x the baseline RMSE and
-       0.40 coverage (9/10 vs 4/10 covered, Fisher exact p = 0.06). The two
-       means agreed on a 20-subject pilot run, so the failure depends on the
-       data rather than appearing always. We did not diagnose the cause;
-       inspect fitted_epsilon in the CSV (a near-0 epsilon means the fit
-       saturates near AUROC 1).
-    3. Pilot schedule (B): RMSE falls monotonically with pilot size (0.058 ->
+    2. GP vs least squares: the power-law GP is not more accurate than a
+       least-squares power-law fit to the same pilots (RMSE 0.042 vs 0.039,
+       same +0.018 bias); the difference is well within seed-to-seed spread.
+       What the GP adds is uncertainty: intervals that covered 9 of 10 seeds,
+       which the LS fit cannot provide at all.
+    3. Arctan mean: the failure is in the arctan curve shape, not in the GP or
+       its priors. The arctan GP predicted 0.80-0.96 against an observed ~0.62
+       in 6 of 10 seeds (5x the baseline RMSE, 0.40 coverage; 9/10 vs 4/10
+       covered, Fisher exact p = 0.06), and LS_arctan failed on the same seeds
+       with similar error (RMSE 0.220). Epsilon at its lower bound (ceiling
+       near 1) explains only 3 of the 6 bad seeds (1, 3, 4); in seeds 6, 7 and
+       8 epsilon was interior. A lower-bound epsilon is also not harmful by
+       itself: the power-law GP had it in 5 of 10 seeds and LS_power_law in 7
+       of 10, yet both predicted well. One candidate explanation, not tested
+       here, is that arctan's argument is linear in raw size, so a small pilot
+       slope extrapolated 64x carries the curve far toward its ceiling,
+       whereas the power law approaches its ceiling slowly. On a 20-subject
+       pilot run the two means agreed, so the failure is data-dependent.
+    4. Pilot schedule (B): RMSE falls monotonically with pilot size (0.058 ->
        0.042 -> 0.030) and quantized likelihood rises (0.096 -> 0.142 ->
        0.190), with similar interval widths. The coverage differences
        (0.80/0.90/0.90) are one miss and may be noise.
-    4. Fixed sigma prior (C): point predictions barely change (RMSE 0.040 vs
+    5. Fixed sigma prior (C): point predictions barely change (RMSE 0.040 vs
        0.042, same bias), but intervals are 2.4x narrower (0.054 vs 0.130) and
        covered only 5 of 10 seeds vs 9 (Fisher exact p = 0.14). That is
        suggestive rather than conclusive at 10 seeds. C's higher QL (0.186)
        reflects sharper, not better-calibrated, intervals.
-    5. Why C differs on real but not synthetic data: the authors' prior sets
+    6. Why C differs on real but not synthetic data: the authors' prior sets
        sigma's prior so that 6 * sqrt(sigma^2 + tau^2) spans 1/2 to 3/4 of the
        headroom (1 - epsilon_min - max pilot AUROC). With pilot AUROCs near
        0.6 the headroom is ~0.4, the targets are ~0.19-0.29, and the
